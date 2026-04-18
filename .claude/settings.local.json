@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(py -m pytest trading_bot/tests/test_strategy_agent.py -v2)",
+      "Bash(py -c ' *)"
+    ]
+  }
+}

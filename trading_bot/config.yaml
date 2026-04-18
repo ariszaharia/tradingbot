@@ -1,0 +1,54 @@
+trading:
+  symbol: "BTC/USDT"
+  exchange: "binance"
+  mode: "paper"           # paper | live
+  primary_timeframe: "1h"
+  execution_timeframe: "5m"
+  confirmation_timeframe: "4h"
+
+capital:
+  initial_capital: 10000  # USDT
+  risk_per_trade_pct: 1.0
+  max_drawdown_daily_pct: 3.0
+  max_drawdown_total_pct: 10.0
+  max_positions: 3
+  max_position_size_pct: 20.0
+
+strategy:
+  active: ["trend_following", "mean_reversion"]
+  min_confidence_score: 0.6
+  cooldown_after_losses: 2   # candles to wait
+
+execution:
+  order_type: "market"        # market | limit
+  max_slippage_pct: 0.15
+  retry_attempts: 3
+  retry_backoff_seconds: [1, 2, 4]
+  partial_fill_timeout_seconds: 60
+  partial_fill_min_pct: 90.0
+  trailing_stop_enabled: true
+  trailing_stop_trigger_atr: 1.0
+  position_monitor_interval_seconds: 30
+
+logging:
+  level: "INFO"
+  daily_report_time_utc: "00:00"
+  alert_consecutive_losses: 5
+  alert_win_rate_threshold: 0.40
+  alert_win_rate_window: 20
+  alert_fees_profit_ratio: 0.10
+  alert_fees_window_days: 7
+
+indicators:
+  ema_periods: [9, 21, 50, 200]
+  rsi_periods: [7, 14]
+  atr_period: 14
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  bb_period: 20
+  bb_std: 2.0
+  volume_sma_period: 20
+  candle_buffer_size: 500
+  anomaly_price_spike_pct: 5.0
+  anomaly_volume_multiplier: 10.0
