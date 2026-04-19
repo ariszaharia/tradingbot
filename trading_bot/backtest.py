@@ -1,8 +1,11 @@
 """
-Backtest engine - 6 months of BTC/USDT 1H historical data.
+Backtest engine - BTC/USDT 1H historical data.
 
 Usage:
     python -m trading_bot.backtest [--months 6] [--capital 10000]
+    python -m trading_bot.backtest --months 12 --strategy trend_following
+    python -m trading_bot.backtest --start-date 2023-04-18 --end-date 2024-04-18
+    python -m trading_bot.backtest --fee-rate 0.002 --slippage 0.0015  # stress test
 
 Data is fetched from Binance via CCXT and cached to disk so subsequent
 runs are instant.  No real orders are placed.
@@ -10,8 +13,8 @@ runs are instant.  No real orders are placed.
 Simulation rules:
   - Entry at close of signal candle (avoids look-ahead)
   - SL / TP checked against next candle high / low
-  - Taker fee: 0.1% on entry and exit
-  - Slippage: fixed 0.05% on entry (market order)
+  - Taker fee: 0.1% on entry and exit (configurable)
+  - Slippage: fixed 0.05% on entry (configurable)
   - One position at a time (single-symbol)
   - All 7 Risk Agent rules enforced per candle
   - Cooldown of 2 candles after 2 consecutive losses
@@ -99,14 +102,16 @@ class Trade:
     entry_idx: int
     exit_idx: int
     duration_candles: int
+    atr_entry: float = 0.0          # ATR at entry (used for trailing stop)
+    peak_favorable: float = 0.0     # highest favorable price seen since entry
 
 
 # ---------------------------------------------------------------------------
 # Backtest engine
 # ---------------------------------------------------------------------------
 
-FEE_RATE = 0.001    # 0.1% per side
-SLIPPAGE  = 0.0005  # 0.05% entry slippage
+FEE_RATE = 0.001    # 0.1% per side (default)
+SLIPPAGE  = 0.0005  # 0.05% entry slippage (default)
 
 
 @dataclass
@@ -116,8 +121,13 @@ class BacktestEngine:
     max_dd_daily_pct: float = 3.0
     max_dd_total_pct: float = 10.0
     max_pos_size_pct: float = 20.0
-    min_confidence: float = 0.6
-    cooldown_after_losses: int = 2
+    min_confidence: float = 0.65
+    cooldown_after_losses: int = 3
+    trailing_stop_enabled: bool = True
+    trailing_stop_trigger_atr: float = 1.0
+    fee_rate: float = FEE_RATE       # override for stress testing
+    slippage_entry: float = SLIPPAGE  # override for stress testing
+    use_strategy_exits: bool = False  # SL/TP are sole exits — stall exits net-negative
 
     capital: float = field(init=False)
     trades: list[Trade] = field(default_factory=list)
@@ -133,13 +143,25 @@ class BacktestEngine:
         self.capital = self.initial_capital
         self.daily_start_capital = self.initial_capital
 
-    def run(self, df_1h: pd.DataFrame, df_4h: pd.DataFrame) -> None:
+    def run(
+        self,
+        df_1h: pd.DataFrame,
+        df_4h: pd.DataFrame,
+        active_strategies: list[str] | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> None:
         from trading_bot.strategies.trend_following import TrendFollowingStrategy
         from trading_bot.strategies.mean_reversion import MeanReversionStrategy
         from trading_bot.models.data_snapshot import DataSnapshot
         from trading_bot.models.trading_signal import Direction
 
-        strategies = [TrendFollowingStrategy({}), MeanReversionStrategy({})]
+        _registry = {
+            "trend_following": TrendFollowingStrategy({}),
+            "mean_reversion": MeanReversionStrategy({}),
+        }
+        enabled = active_strategies or list(_registry.keys())
+        strategies = [_registry[k] for k in enabled if k in _registry]
         ind_cfg = {
             "ema_periods": [9, 21, 50, 200],
             "rsi_periods": [7, 14],
@@ -151,13 +173,30 @@ class BacktestEngine:
 
         warmup = 210
         n = len(df_1h)
-        current_day = df_1h.index[warmup].date()
+
+        # Determine the trading window (warmup data stays intact for indicators)
+        if start_date:
+            start_ts = pd.Timestamp(start_date, tz="UTC")
+            start_idx = max(warmup, int(df_1h.index.searchsorted(start_ts)))
+        else:
+            start_idx = warmup
+        if end_date:
+            end_ts = pd.Timestamp(end_date, tz="UTC")
+            end_idx = int(df_1h.index.searchsorted(end_ts))
+        else:
+            end_idx = n
+
+        if start_idx >= end_idx:
+            print("  No candles in specified date range.")
+            return
+
+        current_day = df_1h.index[start_idx].date()
         self.daily_start_capital = self.capital
 
-        print(f"\n  Running on {n - warmup} candles "
-              f"({df_1h.index[warmup].date()} -> {df_1h.index[-1].date()}) ...")
+        print(f"\n  Running on {end_idx - start_idx} candles "
+              f"({df_1h.index[start_idx].date()} -> {df_1h.index[end_idx - 1].date()}) ...")
 
-        for i in range(warmup, n):
+        for i in range(start_idx, end_idx):
             ts = df_1h.index[i]
 
             if ts.date() != current_day:
@@ -192,48 +231,105 @@ class BacktestEngine:
                 htf_ind = {}
 
             price = float(closes[-1])
+            candle_high = float(highs[-1])
+            candle_low  = float(lows[-1])
 
             # Check open position SL / TP on this candle's high/low
+            # (uses the trailing SL that was updated at end of PREVIOUS candle)
             if self.open_trade is not None:
-                exited = self._check_exit(
-                    self.open_trade,
-                    float(highs[-1]), float(lows[-1]),
-                    price, i,
-                )
+                exited = self._check_exit(self.open_trade, candle_high, candle_low, price, i)
                 if exited:
+                    # Update trailing stop on the closing candle before moving on
                     self.equity_curve.append(self.capital)
                     continue
 
-            snapshot = DataSnapshot(
-                symbol="BTC/USDT",
-                price=price,
-                bid=price * 0.9999,
-                ask=price * 1.0001,
-                spread_pct=0.01,
-                ohlcv={},
-                indicators=indicators,
-                htf_indicators=htf_ind,
-                current_position_direction=(
-                    self.open_trade.direction if self.open_trade else None
-                ),
-            )
+            # Check strategy exit signals for open position
+            if self.open_trade is not None and self.use_strategy_exits:
+                candles_open = i - self.open_trade.entry_idx
+                exit_snapshot = DataSnapshot(
+                    symbol="BTC/USDT",
+                    price=price,
+                    bid=price * 0.9999,
+                    ask=price * 1.0001,
+                    spread_pct=0.01,
+                    ohlcv={},
+                    indicators=indicators,
+                    htf_indicators=htf_ind,
+                    current_position_direction=self.open_trade.direction,
+                    candles_in_position=candles_open,
+                )
+                # Only the strategy that opened the trade can issue a strategy EXIT.
+                # Cross-strategy exits caused premature closures in combined mode,
+                # inflating trade count and collapsing win rate.
+                open_strat_name = self.open_trade.strategy.split("_pullback")[0].split("_momentum")[0]
+                for strat in strategies:
+                    if strat.name != open_strat_name:
+                        continue
+                    sig = strat.evaluate(exit_snapshot)
+                    if sig.direction == Direction.EXIT:
+                        self._close(self.open_trade, price, "STRATEGY_EXIT", i)
+                        break
+                if self.open_trade is None:
+                    self.equity_curve.append(self.capital)
+                    continue
 
+            # Update trailing stop at END of candle (takes effect next candle's exit check)
+            if self.open_trade is not None and self.trailing_stop_enabled:
+                self._update_trailing_stop(self.open_trade, price, candle_high, candle_low)
+
+            # Try entry if no open position
             if self.open_trade is None:
+                entry_snapshot = DataSnapshot(
+                    symbol="BTC/USDT",
+                    price=price,
+                    bid=price * 0.9999,
+                    ask=price * 1.0001,
+                    spread_pct=0.01,
+                    ohlcv={},
+                    indicators=indicators,
+                    htf_indicators=htf_ind,
+                    current_position_direction=None,
+                    candles_in_position=0,
+                )
                 best = None
                 for strat in strategies:
-                    sig = strat.evaluate(snapshot)
+                    sig = strat.evaluate(entry_snapshot)
                     if sig.direction in (Direction.FLAT, Direction.EXIT):
                         continue
                     if best is None or sig.confidence_score > best.confidence_score:
                         best = sig
 
                 if best and self._risk_ok(best):
-                    self._enter(best, i, price)
+                    self._enter(best, i, price, indicators)
 
             self.equity_curve.append(self.capital)
 
         if self.open_trade is not None:
-            self._force_close(self.open_trade, float(df_1h["close"].iloc[-1]), n - 1)
+            last_close = float(df_1h["close"].iloc[end_idx - 1])
+            self._force_close(self.open_trade, last_close, end_idx - 1)
+
+    # --- Trailing stop -------------------------------------------------------
+
+    def _update_trailing_stop(self, t: Trade, close: float, high: float, low: float) -> None:
+        """Move SL to breakeven once trigger is reached, then trail at 1 ATR behind peak."""
+        if t.atr_entry <= 0:
+            return
+        trigger = self.trailing_stop_trigger_atr * t.atr_entry
+        if t.direction == "LONG":
+            t.peak_favorable = max(t.peak_favorable, high)
+            favorable = t.peak_favorable - t.entry_price
+            if favorable >= trigger:
+                # Trail at 1 ATR behind peak, but never below entry (breakeven floor)
+                trail_sl = t.peak_favorable - t.atr_entry
+                new_sl = max(trail_sl, t.entry_price)
+                t.stop_loss = max(t.stop_loss, new_sl)  # only ever raise SL
+        else:  # SHORT
+            t.peak_favorable = min(t.peak_favorable, low)
+            favorable = t.entry_price - t.peak_favorable
+            if favorable >= trigger:
+                trail_sl = t.peak_favorable + t.atr_entry
+                new_sl = min(trail_sl, t.entry_price)
+                t.stop_loss = min(t.stop_loss, new_sl)  # only ever lower SL
 
     # --- Risk gate -----------------------------------------------------------
 
@@ -257,11 +353,11 @@ class BacktestEngine:
 
     # --- Entry ---------------------------------------------------------------
 
-    def _enter(self, signal, idx: int, price: float) -> None:
+    def _enter(self, signal, idx: int, price: float, indicators: dict) -> None:
         from trading_bot.utils.risk_calculator import calc_position_size
 
-        entry = price * (1 + SLIPPAGE) if signal.direction.value == "LONG" \
-                else price * (1 - SLIPPAGE)
+        entry = price * (1 + self.slippage_entry) if signal.direction.value == "LONG" \
+                else price * (1 - self.slippage_entry)
         try:
             risk_units, _ = calc_position_size(
                 self.capital, self.risk_pct, entry, signal.suggested_stop_loss
@@ -274,10 +370,11 @@ class BacktestEngine:
         if units <= 0:
             return
 
-        fee = entry * units * FEE_RATE
-        self.capital -= fee
-        self.daily_pnl -= fee
+        fee_entry = entry * units * self.fee_rate
+        # Entry fee is stored in the trade; capital and daily_pnl are updated at close
+        # via pnl_net = pnl_gross - (fee_entry + fee_exit) to avoid double-counting.
         self.trade_counter += 1
+        atr = indicators.get("atr_14", 0.0)
 
         self.open_trade = Trade(
             signal_id=f"bt-{self.trade_counter:05d}",
@@ -289,11 +386,13 @@ class BacktestEngine:
             take_profit=signal.suggested_take_profit,
             quantity=units,
             pnl_gross=0.0, pnl_net=0.0, pnl_pct=0.0,
-            fees=fee,
+            fees=fee_entry,
             close_reason="",
             entry_idx=idx,
             exit_idx=0,
             duration_candles=0,
+            atr_entry=atr,
+            peak_favorable=entry,  # initialise peak at entry price
         )
 
     # --- Exit ----------------------------------------------------------------
@@ -314,7 +413,7 @@ class BacktestEngine:
         return False
 
     def _close(self, t: Trade, exit_price: float, reason: str, idx: int) -> None:
-        fee_exit = exit_price * t.quantity * FEE_RATE
+        fee_exit = exit_price * t.quantity * self.fee_rate
         t.fees += fee_exit
 
         t.pnl_gross = (exit_price - t.entry_price) * t.quantity \
@@ -364,7 +463,7 @@ def _max_drawdown(equity: list[float]) -> float:
     return mdd
 
 
-def print_report(engine: BacktestEngine, months: int) -> None:
+def print_report(engine: BacktestEngine, months: int = 0) -> None:
     trades = engine.trades
     equity = engine.equity_curve
 
@@ -383,7 +482,7 @@ def print_report(engine: BacktestEngine, months: int) -> None:
     rets_pct = [t.pnl_pct for t in trades]
 
     print(f"\n{sep}")
-    print(f"  BACKTEST RESULTS  BTC/USDT 1H  ({months} months)")
+    print(f"  BACKTEST RESULTS  BTC/USDT 1H")
     print(sep)
     print(f"  Period          : {engine.equity_curve and len(engine.equity_curve)} candles")
     print(f"  Initial capital : ${engine.initial_capital:>10,.2f}")
@@ -432,26 +531,73 @@ def print_report(engine: BacktestEngine, months: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="BTC/USDT Backtest")
-    parser.add_argument("--months",   type=int,   default=6)
-    parser.add_argument("--capital",  type=float, default=10_000.0)
-    parser.add_argument("--risk-pct", type=float, default=1.0)
+    parser.add_argument("--months",     type=int,   default=6,
+                        help="Months of data to fetch (ignored if --start-date used)")
+    parser.add_argument("--capital",    type=float, default=10_000.0)
+    parser.add_argument("--risk-pct",   type=float, default=1.0)
+    parser.add_argument("--strategy",   type=str,   default=None,
+                        help="Run single strategy: trend_following | mean_reversion")
+    parser.add_argument("--start-date", type=str,   default=None,
+                        help="Start date YYYY-MM-DD (needs enough history before for warmup)")
+    parser.add_argument("--end-date",   type=str,   default=None,
+                        help="End date YYYY-MM-DD (exclusive)")
+    parser.add_argument("--fee-rate",   type=float, default=None,
+                        help="Override fee rate per side (default 0.001)")
+    parser.add_argument("--slippage",   type=float, default=None,
+                        help="Override entry slippage (default 0.0005)")
+    parser.add_argument("--use-strategy-exits", action="store_true", default=False,
+                        help="Re-enable stall/structural exits (default: disabled)")
     args = parser.parse_args()
 
+    # When a date window is given, load 36m so warmup candles are available
+    months = args.months
+    if args.start_date:
+        months = max(months, 36)
+
     print(f"\n{'='*60}")
-    print(f"  BACKTEST  BTC/USDT  {args.months} months  capital=${args.capital:,.0f}")
+    print(f"  BACKTEST  BTC/USDT  {months} months  capital=${args.capital:,.0f}")
+    if args.start_date or args.end_date:
+        print(f"  Window: {args.start_date or 'start'} -> {args.end_date or 'end'}")
+    if args.strategy:
+        print(f"  Strategy: {args.strategy}")
+    if args.fee_rate or args.slippage:
+        print(f"  Costs: fee={args.fee_rate or FEE_RATE:.4f}  slippage={args.slippage or SLIPPAGE:.4f}")
     print(f"{'='*60}")
     print("  Fetching data ...")
 
-    df_1h = fetch_ohlcv("BTC/USDT", "1h",  args.months)
-    df_4h = fetch_ohlcv("BTC/USDT", "4h",  args.months)
+    df_1h = fetch_ohlcv("BTC/USDT", "1h", months)
+    df_4h = fetch_ohlcv("BTC/USDT", "4h", months)
     print(f"  1H candles: {len(df_1h)}  |  4H candles: {len(df_4h)}")
+
+    import yaml
+    try:
+        cfg_path = Path("trading_bot/config.yaml")
+        cfg = yaml.safe_load(cfg_path.read_text()) if cfg_path.exists() else {}
+    except Exception:
+        cfg = {}
+
+    active = cfg.get("strategy", {}).get("active", ["trend_following", "mean_reversion"])
+    if args.strategy:
+        active = [args.strategy]
+    min_conf = cfg.get("strategy", {}).get("min_confidence_score", 0.65)
+    cooldown = cfg.get("strategy", {}).get("cooldown_after_losses", 3)
+    trailing_enabled = cfg.get("execution", {}).get("trailing_stop_enabled", False)
+    trailing_trigger = cfg.get("execution", {}).get("trailing_stop_trigger_atr", 1.0)
 
     engine = BacktestEngine(
         initial_capital=args.capital,
         risk_pct=args.risk_pct,
+        min_confidence=min_conf,
+        cooldown_after_losses=cooldown,
+        trailing_stop_enabled=trailing_enabled,
+        trailing_stop_trigger_atr=trailing_trigger,
+        fee_rate=args.fee_rate if args.fee_rate is not None else FEE_RATE,
+        slippage_entry=args.slippage if args.slippage is not None else SLIPPAGE,
+        use_strategy_exits=args.use_strategy_exits,
     )
-    engine.run(df_1h, df_4h)
-    print_report(engine, args.months)
+    engine.run(df_1h, df_4h, active_strategies=active,
+               start_date=args.start_date, end_date=args.end_date)
+    print_report(engine, months)
 
 
 if __name__ == "__main__":

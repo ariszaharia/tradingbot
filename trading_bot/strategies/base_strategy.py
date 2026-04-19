@@ -48,12 +48,40 @@ class BaseStrategy(ABC):
         return max(sl, 1e-6), max(tp, 1e-6)
 
     def _htf_is_bullish(self, htf: dict[str, float]) -> bool:
-        """4H EMA21 > EMA50 → bullish higher-timeframe bias."""
-        ema21 = htf.get("ema_21", float("nan"))
-        ema50 = htf.get("ema_50", float("nan"))
-        return ema21 > ema50
+        """Three-layer 4H bullish confirmation:
+        EMA21 > EMA50 (near-term), EMA50 > EMA200 (medium-term), ADX > 20 (active trend)."""
+        ema21  = htf.get("ema_21",  float("nan"))
+        ema50  = htf.get("ema_50",  float("nan"))
+        ema200 = htf.get("ema_200", float("nan"))
+        adx14  = htf.get("adx_14",  float("nan"))
+        ema_near = ema21 > ema50
+        ema_mid  = ema50 > ema200 if ema200 == ema200 else True  # pass if unavailable
+        adx_ok   = adx14 > 20    if adx14  == adx14  else True
+        return ema_near and ema_mid and adx_ok
 
     def _htf_is_bearish(self, htf: dict[str, float]) -> bool:
-        ema21 = htf.get("ema_21", float("nan"))
-        ema50 = htf.get("ema_50", float("nan"))
-        return ema21 < ema50
+        """Three-layer 4H bearish confirmation:
+        EMA21 < EMA50, EMA50 < EMA200, ADX > 20."""
+        ema21  = htf.get("ema_21",  float("nan"))
+        ema50  = htf.get("ema_50",  float("nan"))
+        ema200 = htf.get("ema_200", float("nan"))
+        adx14  = htf.get("adx_14",  float("nan"))
+        ema_near = ema21 < ema50
+        ema_mid  = ema50 < ema200 if ema200 == ema200 else True
+        adx_ok   = adx14 > 20    if adx14  == adx14  else True
+        return ema_near and ema_mid and adx_ok
+
+    def _is_trending(self, indicators: dict[str, float], threshold: float = 20.0) -> bool:
+        """True when ADX > threshold — directional/trending market."""
+        v = indicators.get("adx_14", float("nan"))
+        return v > threshold if v == v else False
+
+    def _is_ranging(self, indicators: dict[str, float], threshold: float = 25.0) -> bool:
+        """True when ADX < threshold — choppy/ranging market."""
+        v = indicators.get("adx_14", float("nan"))
+        return v < threshold if v == v else False
+
+    def _is_high_volatility(self, indicators: dict[str, float], threshold: float = 75.0) -> bool:
+        """True when ATR percentile > threshold — elevated volatility regime."""
+        v = indicators.get("atr_pct_50", float("nan"))
+        return v > threshold if v == v else False

@@ -481,3 +481,94 @@ Implement in this order:
 
 Ready? Start with step 1 — define all Pydantic models 
 and explain each field with its correct type.
+
+═══════════════════════════════════════════════════════════
+SESSION NOTES — 2026-04-19
+═══════════════════════════════════════════════════════════
+
+## Changes made this session
+
+### New files
+- trading_bot/regime_runner.py   — runs 3 strategies x 3 windows, prints comparison matrix
+- trading_bot/walkforward_runner.py — 9-fold OOS validation (IS=6m, OOS=3m)
+- trading_bot/stress_runner.py   — cost sensitivity: baseline / moderate / conservative fees
+
+### backtest.py
+- BacktestEngine: added fee_rate, slippage_entry, use_strategy_exits fields
+- use_strategy_exits defaults to False (SL/TP are sole exits — stall exits net-negative)
+- Fixed cross-strategy EXIT bug: only the strategy that opened a position can close it
+- Added --start-date, --end-date, --strategy, --fee-rate, --slippage, --use-strategy-exits CLI args
+- Fixed end-of-run force-close to respect the end_idx window
+
+### strategies/trend_following.py
+- SL multiplier: 1.5 -> 2.0 ATR (wider room to breathe)
+- TP multiplier: 4.0 -> 5.0 ATR (R:R = 2.5:1, breakeven WR = 28.6%)
+- Added MODE 2: momentum continuation when ADX > 35 (no strict EMA21 touch required)
+- Pullback zone widened: 0.1% -> 0.3% of EMA21
+- Pullback close condition tightened: close > EMA21 -> close > EMA9 (strong bounce only)
+- Pullback now requires MACD hist > 0 as a HARD gate (eliminates fading momentum setups)
+- Added DI+ > DI- directional gate for LONG entries
+- Time exit extended: 12 -> 20 candles (but use_strategy_exits=False makes this moot)
+
+### strategies/mean_reversion.py
+- RSI7 thresholds relaxed: < 20 -> < 25  and  > 80 -> > 75
+- Time exit extended: 6 -> 8 candles
+
+## Verified results (end-of-session state)
+
+Trend-following only, exits disabled, across all three 1-year windows:
+
+  Bull  Apr23-Apr24:  ret=+1.8%  WR=37%  PF=1.36  T=51  MDD=3.9%
+  Mid   Apr24-Apr25:  ret=+1.5%  WR=39%  PF=1.28  T=49  MDD=2.4%
+  Recent Apr25-Apr26: ret=+3.3%  WR=41%  PF=1.47  T=58  MDD=3.3%
+
+ALL THREE WINDOWS POSITIVE — first time achieving this milestone.
+
+6-month backtest: +0.66%, PF=1.23, MDD=3.64% (vs original -10.12%)
+12-month backtest: +0.88%, PF=1.36, MDD=2.73%
+
+Walk-forward (IS=6m, OOS=3m, 9 folds) — trend_only, run with exits=False but BEFORE MACD gate:
+  avg ret=-0.0%  avg PF=1.20  positive folds=4/9  [FAIL]
+  Problem fold: Nov 2023-Feb 2024 (ret=-3.3%, PF=0.48)
+
+Stress test results are from OLD code (pre-improvements). Need rerun.
+
+## What to do next session (priority order)
+
+1. Re-run stress test with current code:
+      py -m trading_bot.stress_runner
+   Confirm the edge (PF>1 in all windows) survives moderate costs.
+   If it breaks at moderate fees, the edge is too thin.
+
+2. Re-run walk-forward with current code:
+      py -m trading_bot.walkforward_runner
+   Target: more than 5/9 folds positive, all folds PF > 1.0.
+   Investigate the bad Nov 2023-Feb 2024 fold — why PF=0.48?
+   Check if it's a specific market condition (choppy BTC, no clear trend).
+
+3. Investigate the bad fold:
+      py -m trading_bot.backtest --start-date 2023-11-04 --end-date 2024-02-04 --strategy trend_following --use-strategy-exits
+   Use --verbose flag (add to walkforward_runner) to see per-trade breakdown.
+   If the loss is concentrated in a specific market phase, add a regime gate.
+
+4. Test combined mode with new code:
+      py -m trading_bot.regime_runner
+   Check if trend + mean_reversion combined is now better or still worse than trend-only.
+   Cross-strategy exit bug is fixed, so combined should be fairer now.
+
+5. Consider adding volume filter to momentum mode:
+   Momentum entries currently don't require volume confirmation.
+   Require vol > vol_sma * 1.1 as hard gate for momentum mode.
+   Could reduce false entries in low-volume drift.
+
+6. If walk-forward shows 7+/9 positive folds with PF>1 consistently:
+   Update config.yaml to reflect final parameters and mark strategy as validated.
+   Document the regime conditions under which each mode (pullback vs momentum) performs best.
+
+## Key invariants to preserve
+
+- Do NOT re-enable use_strategy_exits without testing — verified net-negative.
+- Do NOT re-enable trailing_stop without testing — cuts winners before 5 ATR TP.
+- Do NOT run combined mode without checking cross-strategy metrics separately first.
+- Acceptance gate: positive return AND PF > 1.0 in ALL tested windows before any change is considered valid.
+- Always run new code across all 3 regime windows before claiming improvement.

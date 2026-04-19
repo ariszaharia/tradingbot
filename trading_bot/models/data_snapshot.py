@@ -40,3 +40,7 @@ class DataSnapshot(BaseModel):
     # are only evaluated against the relevant open position direction.
     # None means no open position — EXIT checks are skipped entirely.
     current_position_direction: str | None = None  # "LONG" | "SHORT" | None
+
+    # How many primary-timeframe candles the current position has been open.
+    # Used by strategies for time-based exit logic.
+    candles_in_position: int = 0

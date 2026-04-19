@@ -12,12 +12,19 @@ capital:
   max_drawdown_daily_pct: 3.0
   max_drawdown_total_pct: 10.0
   max_positions: 3
-  max_position_size_pct: 20.0
+  max_position_size_pct: 40.0   # raised: 20% was capping BTC positions at ~$2k notional, distorting R:R
 
 strategy:
-  active: ["trend_following", "mean_reversion"]
-  min_confidence_score: 0.6
-  cooldown_after_losses: 2   # candles to wait
+  active: ["trend_following"]   # mean_reversion disabled: 0% win rate on BTC 1H
+  min_confidence_score: 0.65   # raised: filters low-quality setups
+  cooldown_after_losses: 3     # candles to wait after 2 consecutive losses
+
+regime:
+  adx_trend_threshold: 25      # ADX must exceed this for trend entries
+  adx_range_threshold: 25      # ADX must be below this for mean-reversion entries
+  atr_pct_volatility_cap: 80   # skip mean-reversion when volatility is extreme
+  time_exit_candles_trend: 8   # exit stalled trend trades after N candles
+  time_exit_candles_reversion: 6  # exit stalled reversion trades after N candles
 
 execution:
   order_type: "market"        # market | limit
@@ -26,7 +33,7 @@ execution:
   retry_backoff_seconds: [1, 2, 4]
   partial_fill_timeout_seconds: 60
   partial_fill_min_pct: 90.0
-  trailing_stop_enabled: true
+  trailing_stop_enabled: false
   trailing_stop_trigger_atr: 1.0
   position_monitor_interval_seconds: 30
 

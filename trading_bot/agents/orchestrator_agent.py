@@ -64,6 +64,10 @@ class OrchestratorAgent(BaseAgent):
         # Daily reset tracking
         self._trading_day_start_utc: int = self._start_of_day_ms()
 
+        # Candle-level tracking for time-based exits
+        self._candle_counter: int = 0
+        self._position_open_candle: dict[str, int] = {}  # signal_id → candle index at open
+
         # Optional external status callback (used by tests / UI)
         self._status_callbacks: list[StatusCallback] = []
 
@@ -166,11 +170,15 @@ class OrchestratorAgent(BaseAgent):
         await self._check_daily_reset()
         await self._decrement_cooldown()
 
+        self._candle_counter += 1
         snapshot = DataSnapshot(**msg.payload)
 
-        # Inject current position direction so strategies can check EXIT conditions
+        # Inject position context so strategies can evaluate EXIT conditions
         if self._state.open_positions:
-            snapshot.current_position_direction = self._state.open_positions[0].direction
+            pos = self._state.open_positions[0]
+            snapshot.current_position_direction = pos.direction
+            opened_at = self._position_open_candle.get(pos.signal_id, self._candle_counter)
+            snapshot.candles_in_position = self._candle_counter - opened_at
 
         request = AgentMessage(
             sender=AgentName.ORCHESTRATOR,
@@ -289,6 +297,7 @@ class OrchestratorAgent(BaseAgent):
             take_profit=msg.payload.get("take_profit", 0.0),
         )
         self._state.open_positions.append(pos)
+        self._position_open_candle[report.signal_id] = self._candle_counter
         self.log.info(
             "Position opened",
             signal_id=report.signal_id,
@@ -311,6 +320,7 @@ class OrchestratorAgent(BaseAgent):
             p for p in self._state.open_positions
             if p.signal_id != close.signal_id
         ]
+        self._position_open_candle.pop(close.signal_id, None)
 
         # Update PnL
         self._state.daily_pnl += close.pnl_net

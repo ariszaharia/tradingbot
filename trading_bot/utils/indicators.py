@@ -104,6 +104,97 @@ def volume_sma(volumes: np.ndarray, period: int = 20) -> np.ndarray:
     return result
 
 
+def adx_di(
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+    period: int = 14,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Average Directional Index + Directional Indicators (Wilder method).
+    Returns (adx, di_plus, di_minus) — all NaN-padded arrays."""
+    n = len(closes)
+    if n < period * 2 + 1:
+        nan = np.full(n, np.nan)
+        return nan, nan, nan
+
+    prev_close = np.empty(n)
+    prev_close[0] = closes[0]
+    prev_close[1:] = closes[:-1]
+    prev_high = np.empty(n)
+    prev_high[0] = highs[0]
+    prev_high[1:] = highs[:-1]
+    prev_low = np.empty(n)
+    prev_low[0] = lows[0]
+    prev_low[1:] = lows[:-1]
+
+    tr = np.maximum(
+        highs - lows,
+        np.maximum(np.abs(highs - prev_close), np.abs(lows - prev_close)),
+    )
+    up_move = highs - prev_high
+    down_move = prev_low - lows
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    s_tr = np.full(n, np.nan)
+    s_plus = np.full(n, np.nan)
+    s_minus = np.full(n, np.nan)
+
+    if n > period:
+        s_tr[period] = np.sum(tr[1:period + 1])
+        s_plus[period] = np.sum(plus_dm[1:period + 1])
+        s_minus[period] = np.sum(minus_dm[1:period + 1])
+        for i in range(period + 1, n):
+            s_tr[i] = s_tr[i - 1] - s_tr[i - 1] / period + tr[i]
+            s_plus[i] = s_plus[i - 1] - s_plus[i - 1] / period + plus_dm[i]
+            s_minus[i] = s_minus[i - 1] - s_minus[i - 1] / period + minus_dm[i]
+
+    di_plus = np.full(n, np.nan)
+    di_minus = np.full(n, np.nan)
+    dx = np.full(n, np.nan)
+
+    valid = s_tr > 0
+    di_plus[valid] = 100.0 * s_plus[valid] / s_tr[valid]
+    di_minus[valid] = 100.0 * s_minus[valid] / s_tr[valid]
+    di_sum = di_plus + di_minus
+    valid_sum = (di_sum > 0) & valid
+    dx[valid_sum] = 100.0 * np.abs(
+        di_plus[valid_sum] - di_minus[valid_sum]
+    ) / di_sum[valid_sum]
+
+    adx_arr = np.full(n, np.nan)
+    first_dx = np.where(~np.isnan(dx))[0]
+    if len(first_dx) >= period:
+        seed = first_dx[period - 1]
+        adx_arr[seed] = np.nanmean(dx[first_dx[0]:seed + 1])
+        for i in range(seed + 1, n):
+            if not np.isnan(dx[i]) and not np.isnan(adx_arr[i - 1]):
+                adx_arr[i] = (adx_arr[i - 1] * (period - 1) + dx[i]) / period
+
+    return adx_arr, di_plus, di_minus
+
+
+def atr_percentile(
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+    period: int = 14,
+    lookback: int = 50,
+) -> np.ndarray:
+    """Percentile rank of current ATR vs past `lookback` ATR values (0–100).
+    High values = elevated volatility regime."""
+    atr_arr = atr(highs, lows, closes, period)
+    result = np.full(len(closes), np.nan)
+    start = period + lookback
+    for i in range(start, len(closes)):
+        window = atr_arr[i - lookback:i + 1]
+        valid = window[~np.isnan(window)]
+        if len(valid) < 2:
+            continue
+        result[i] = float(np.sum(valid[:-1] <= valid[-1])) / (len(valid) - 1) * 100.0
+    return result
+
+
 def compute_all(
     opens: np.ndarray,
     highs: np.ndarray,
@@ -152,6 +243,13 @@ def compute_all(
     result["bb_lower"] = last(bb_l)
 
     result["volume_sma_20"] = last(volume_sma(volumes, cfg.get("volume_sma_period", 20)))
+
+    adx_arr, di_plus_arr, di_minus_arr = adx_di(highs, lows, closes, period=14)
+    result["adx_14"] = last(adx_arr)
+    result["di_plus_14"] = last(di_plus_arr)
+    result["di_minus_14"] = last(di_minus_arr)
+
+    result["atr_pct_50"] = last(atr_percentile(highs, lows, closes, period=14, lookback=50))
 
     # Latest candle raw values (convenient for strategy logic)
     result["open"] = float(opens[-1])
