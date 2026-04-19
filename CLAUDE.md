@@ -533,42 +533,107 @@ Walk-forward (IS=6m, OOS=3m, 9 folds) — trend_only, run with exits=False but B
 
 Stress test results are from OLD code (pre-improvements). Need rerun.
 
-## What to do next session (priority order)
+═══════════════════════════════════════════════════════════
+SESSION NOTES — 2026-04-19 (session 4)
+═══════════════════════════════════════════════════════════
 
-1. Re-run stress test with current code:
-      py -m trading_bot.stress_runner
-   Confirm the edge (PF>1 in all windows) survives moderate costs.
-   If it breaks at moderate fees, the edge is too thin.
+## Strategy redesign implemented (STRATEGY_REDESIGN.md by Opus)
 
-2. Re-run walk-forward with current code:
-      py -m trading_bot.walkforward_runner
-   Target: more than 5/9 folds positive, all folds PF > 1.0.
-   Investigate the bad Nov 2023-Feb 2024 fold — why PF=0.48?
-   Check if it's a specific market condition (choppy BTC, no clear trend).
+Old strategies (trend_following, mean_reversion) replaced by:
+  - breakout_strategy.py       — regime-gated volatility compression breakout
+  - cascade_reversal.py        — liquidation cascade reversal (LONG only)
+  - weekly_momentum.py         — weekly-trend-gated 4H EMA21 pullback
 
-3. Investigate the bad fold:
-      py -m trading_bot.backtest --start-date 2023-11-04 --end-date 2024-02-04 --strategy trend_following --use-strategy-exits
-   Use --verbose flag (add to walkforward_runner) to see per-trade breakdown.
-   If the loss is concentrated in a specific market phase, add a regime gate.
+New infrastructure:
+  - models/market_regime.py    — MarketRegime Pydantic model
+  - strategies/regime_detector.py — detects CONSOLIDATION / TRENDING / VOLATILE from daily data
+    * Uses 4-day LAG: evaluates conditions on data[:-4] so breakout candles don't
+      mask their own consolidation (critical design detail — do not remove the lag)
+  - utils/levels.py            — Fibonacci retracement, support levels
+  - models/trading_signal.py   — added ExitLevel, exit_levels (scaled partial exits)
+  - backtest.py                — full rewrite: daily + weekly data, look-ahead-free masks
+    * 4H mask: df_4h.index <= ts - Timedelta(hours=4)
+    * Daily mask: df_1d.index <= ts - Timedelta(hours=24)
+    * Weekly mask: df_1w.index <= ts - Timedelta(days=7)
+    * Partial exit engine: TP1 → breakeven → TP2 → trailing
+  - Daily data cache: BTC_USDT_1d_36m.json (1080 candles, fetched this session)
+  - Weekly derived from daily resample (avoids CCXT weekly alignment issues)
 
-4. Test combined mode with new code:
-      py -m trading_bot.regime_runner
-   Check if trend + mean_reversion combined is now better or still worse than trend-only.
-   Cross-strategy exit bug is fixed, so combined should be fairer now.
+## End-of-session test results
 
-5. Consider adding volume filter to momentum mode:
-   Momentum entries currently don't require volume confirmation.
-   Require vol > vol_sma * 1.1 as hard gate for momentum mode.
-   Could reduce false entries in low-volume drift.
+weekly_momentum (36m, 15 trades): WR=26.7%, PF=0.158, ret=-1.60%
+  73% strategy exits (EMA21/EMA50 invalidation) — caused by Bug 1 below
 
-6. If walk-forward shows 7+/9 positive folds with PF>1 consistently:
-   Update config.yaml to reflect final parameters and mark strategy as validated.
-   Document the regime conditions under which each mode (pullback vs momentum) performs best.
+breakout: 0 trades in 3 years — root cause not fully diagnosed (see bugs below)
 
-## Key invariants to preserve
+cascade_reversal: 0 trades — RSI<22 + volume>3x + 5% drop all simultaneously is rare;
+  may need to loosen one condition or accept very low trade frequency
 
-- Do NOT re-enable use_strategy_exits without testing — verified net-negative.
-- Do NOT re-enable trailing_stop without testing — cuts winners before 5 ATR TP.
-- Do NOT run combined mode without checking cross-strategy metrics separately first.
-- Acceptance gate: positive return AND PF > 1.0 in ALL tested windows before any change is considered valid.
-- Always run new code across all 3 regime windows before claiming improvement.
+## Bugs fixed this session (not yet re-tested)
+
+Bug 1 — weekly_momentum immediate invalidation exits:
+  Entry was missing 4H EMA21 > EMA50 gate. Trades entered when EMA21 < EMA50,
+  then invalidation exit fired on the next bar. Fix: hard gate added before entry checks.
+
+Bug 2 — weekly_momentum TP1 too close to entry:
+  prev_swing_high was 20 4H bars = 3.3 days. Too shallow — winner was $6 gross.
+  Fix: changed to 60 4H bars ≈ 10 days (renamed key: prev_swing_high_60).
+
+## What to run next session
+
+Run these IN ORDER. Each one short (seconds with cached data). Stop at first failure.
+
+1. weekly_momentum fixed (should see fewer strategy exits, larger winners):
+      py -m trading_bot.backtest --strategy weekly_momentum --months 36
+
+2. breakout diagnostic (check if any consolidation + breakout setups exist in data):
+      py -c "
+import json, numpy as np, pandas as pd
+from trading_bot.utils.indicators import compute_all
+from trading_bot.strategies.regime_detector import detect_regime
+data_1d = json.loads(open('trading_bot/.cache/BTC_USDT_1d_36m.json').read())
+data_4h = json.loads(open('trading_bot/.cache/BTC_USDT_4h_36m.json').read())
+def to_df(d):
+    df = pd.DataFrame(d, columns=['timestamp','open','high','low','close','volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+    return df.set_index('timestamp')
+df_1d = to_df(data_1d); df_4h = to_df(data_4h)
+cfg = {'ema_periods':[9,21,50,200],'rsi_periods':[7,14],'atr_period':14,'macd_fast':12,'macd_slow':26,'macd_signal':9,'bb_period':20,'bb_std':2.0,'volume_sma_period':20}
+cons=bo=vol_ok=rsi_ok=body_ok=all_ok=0
+for i in range(0, len(df_4h)-1):
+    ts = df_4h.index[i]
+    d_mask = df_1d.index <= ts - pd.Timedelta(hours=24)
+    if d_mask.sum() < 165: continue
+    d_win = df_1d[d_mask].iloc[-250:]
+    r = detect_regime(d_win['high'].values.astype(float), d_win['low'].values.astype(float), d_win['close'].values.astype(float), 0)
+    if r is None or r.regime != 'CONSOLIDATION': continue
+    cons += 1
+    win = df_4h.iloc[max(0,i-210):i+1]
+    ind = compute_all(win['open'].values.astype(float), win['high'].values.astype(float), win['low'].values.astype(float), win['close'].values.astype(float), win['volume'].values.astype(float), cfg)
+    c = ind.get('close',0); h = ind.get('high',0); l = ind.get('low',0); o = ind.get('open',0)
+    v = ind.get('volume',0); vs = ind.get('volume_sma_20',1); rsi = ind.get('rsi_14',0)
+    rh = r.consolidation_range_high
+    if c > rh: bo += 1
+    else: continue
+    bp = abs(c-o)/(h-l) if h>l else 0
+    sl_pct = (c - r.consolidation_range_low)/c*100
+    if v > vs*2: vol_ok += 1
+    if 55<=rsi<=70: rsi_ok += 1
+    if bp > 0.6: body_ok += 1
+    if v>vs*2 and 55<=rsi<=70 and bp>0.6 and sl_pct<=3: all_ok+=1; print(f'{ts.date()} rsi={rsi:.0f} vol={v/vs:.1f}x body={bp:.0%} sl={sl_pct:.1f}%')
+print(f'Consolidation 4H bars: {cons}')
+print(f'4H close > range_high: {bo}')
+print(f'vol>2x:{vol_ok}  rsi_ok:{rsi_ok}  body_ok:{body_ok}  ALL:{all_ok}')
+"
+
+3. cascade_reversal (just count how many setups exist regardless of all conditions):
+      py -m trading_bot.backtest --strategy cascade_reversal --months 36
+
+## Key invariants (NEW)
+
+- Do NOT remove the 4-day lag from regime_detector — it is structural, not cosmetic.
+- Do NOT re-enable trailing_stop globally — managed per-strategy via exit_levels.
+- Do NOT run combined mode until each strategy independently shows PF > 1.0.
+- Acceptance gate: positive return AND PF > 1.0 in all tested windows before valid.
+- All backtest runs use --months 36 (12m too short for regime detector warmup).
+- use_strategy_exits=True by default for new strategies (opposite of old system).

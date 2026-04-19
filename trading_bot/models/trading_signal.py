@@ -11,6 +11,14 @@ class Direction(str, Enum):
     EXIT = "EXIT"    # close existing position
 
 
+class ExitLevel(BaseModel):
+    """One level in a scaled exit plan."""
+    price: float                    # target price (0.0 for trailing levels)
+    fraction: float                 # fraction of ORIGINAL position to close here
+    trailing: bool = False          # if True, use trailing ATR distance (price ignored)
+    trailing_atr_mult: float = 0.0  # ATR multiple for trailing distance
+
+
 class TradingSignal(BaseModel):
     signal_id: str = Field(description="Unique ID; Execution Agent uses this for idempotency")
     direction: Direction
@@ -21,11 +29,13 @@ class TradingSignal(BaseModel):
 
     entry_price: float = Field(gt=0)
 
-    # ATR-based: entry ± 1.5 * ATR(14)
     suggested_stop_loss: float = Field(gt=0)
 
-    # ATR-based: entry ± 3.0 * ATR(14)  → R:R = 2:1
+    # TP1 price for single-TP trades; first level for multi-level exits
     suggested_take_profit: float = Field(gt=0)
+
+    # Scaled exit plan — empty means single TP at suggested_take_profit
+    exit_levels: list[ExitLevel] = Field(default_factory=list)
 
     timeframe: str
     reasoning: list[str] = Field(default_factory=list, description="Human-readable list of conditions met")

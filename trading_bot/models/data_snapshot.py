@@ -3,6 +3,8 @@ import time
 from typing import Any
 from pydantic import BaseModel, Field
 
+from trading_bot.models.market_regime import MarketRegime
+
 
 class DataSnapshot(BaseModel):
     symbol: str
@@ -23,15 +25,24 @@ class DataSnapshot(BaseModel):
     )
 
     # All pre-calculated indicator values, flat dict.
-    # Keys follow the pattern: "ema_9", "ema_21", "rsi_14", "atr_14",
-    # "macd_line", "macd_signal", "macd_hist",
-    # "bb_upper", "bb_middle", "bb_lower",
-    # "volume_sma_20"
-    # Values are for the most recently CLOSED candle on the primary timeframe.
+    # Keys: "ema_9", "ema_21", "rsi_14", "atr_14", "macd_line", "macd_signal",
+    # "macd_hist", "bb_upper", "bb_middle", "bb_lower", "volume_sma_20",
+    # "cascade_high_4h", "drop_from_cascade_pct", "lower_wick_count_4h",
+    # "prev_swing_high_20", "prev_swing_low_20"
+    # Values are for the most recently CLOSED candle on the primary (1H) timeframe.
     indicators: dict[str, float] = Field(default_factory=dict)
 
-    # Higher-timeframe confirmation values (4H)
+    # 4H indicators (confirmation timeframe)
     htf_indicators: dict[str, float] = Field(default_factory=dict)
+
+    # Daily indicators (regime detection, support levels)
+    daily_indicators: dict[str, float] = Field(default_factory=dict)
+
+    # Weekly indicators (weekly trend for Strategy 3)
+    weekly_indicators: dict[str, float] = Field(default_factory=dict)
+
+    # Daily regime detection result
+    regime: MarketRegime | None = None
 
     anomaly_flag: bool = False
     anomaly_reason: str | None = None

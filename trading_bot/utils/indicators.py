@@ -174,6 +174,29 @@ def adx_di(
     return adx_arr, di_plus, di_minus
 
 
+def bb_width_percentile(
+    closes: np.ndarray,
+    period: int = 20,
+    lookback: int = 100,
+) -> np.ndarray:
+    """Percentile rank of BB width (upper-lower)/middle vs past `lookback` values (0–100).
+    0 = tightest (consolidating), 100 = widest (expanding)."""
+    bb_u, bb_m, bb_l = bollinger_bands(closes, period)
+    width = np.full(len(closes), np.nan)
+    valid = bb_m > 0
+    width[valid] = (bb_u[valid] - bb_l[valid]) / bb_m[valid]
+
+    result = np.full(len(closes), np.nan)
+    start = period + lookback
+    for i in range(start, len(closes)):
+        window = width[i - lookback: i + 1]
+        v = window[~np.isnan(window)]
+        if len(v) < 2:
+            continue
+        result[i] = float(np.sum(v[:-1] <= v[-1])) / (len(v) - 1) * 100.0
+    return result
+
+
 def atr_percentile(
     highs: np.ndarray,
     lows: np.ndarray,
@@ -251,11 +274,47 @@ def compute_all(
 
     result["atr_pct_50"] = last(atr_percentile(highs, lows, closes, period=14, lookback=50))
 
+    # BB width percentile (for regime detection on daily)
+    result["bb_width_pct_100"] = last(bb_width_percentile(closes, period=20, lookback=100))
+
     # Latest candle raw values (convenient for strategy logic)
     result["open"] = float(opens[-1])
     result["high"] = float(highs[-1])
     result["low"] = float(lows[-1])
     result["close"] = float(closes[-1])
     result["volume"] = float(volumes[-1])
+    result["prev_close"] = float(closes[-2]) if len(closes) >= 2 else float("nan")
+
+    # Cascade detection helpers (used on 1H data by CascadeReversalStrategy)
+    # cascade_high: max high of last 4 completed candles (excludes current)
+    if len(highs) >= 5:
+        result["cascade_high_4h"] = float(np.max(highs[-5:-1]))
+        result["cascade_low_4h"]  = float(np.min(lows[-5:-1]))
+        cascade_h = result["cascade_high_4h"]
+        result["drop_from_cascade_pct"] = (
+            (cascade_h - closes[-1]) / cascade_h * 100 if cascade_h > 0 else 0.0
+        )
+        # Count of last 4 completed candles with lower wick > 50% of body
+        wick_count = 0
+        for j in range(-5, -1):
+            body = abs(closes[j] - opens[j])
+            lower_wick = min(opens[j], closes[j]) - lows[j]
+            if body > 0 and lower_wick > 0.5 * body:
+                wick_count += 1
+        result["lower_wick_count_4h"] = float(wick_count)
+    else:
+        result["cascade_high_4h"] = float("nan")
+        result["cascade_low_4h"]  = float("nan")
+        result["drop_from_cascade_pct"] = float("nan")
+        result["lower_wick_count_4h"] = float("nan")
+
+    # Swing high/low of last 60 completed candles (TP reference for weekly momentum).
+    # 60 × 4H = 240 hours ≈ 10 days — captures a meaningful prior swing.
+    if len(highs) >= 61:
+        result["prev_swing_high_60"] = float(np.max(highs[-61:-1]))
+        result["prev_swing_low_60"]  = float(np.min(lows[-61:-1]))
+    else:
+        result["prev_swing_high_60"] = float("nan")
+        result["prev_swing_low_60"]  = float("nan")
 
     return result
